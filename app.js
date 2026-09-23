@@ -116,16 +116,51 @@ if (!PEXELS_API_KEY && !PIXABAY_API_KEY) {
 // ==================== OBJECT STORAGE (custom image uploads) ====================
 // S3-compatible client — works with Cloudflare R2, Backblaze B2, MinIO, or
 // AWS S3 itself, just by pointing R2_ENDPOINT at the right host. Custom
-// image upload is an optional feature: if these aren't set, the rest of
-// the app runs fine, the upload endpoints just return 503.
-const R2_ENDPOINT = process.env.R2_ENDPOINT;
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET = process.env.R2_BUCKET;
-const R2_CONFIGURED = !!(R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
+// image upload is an optional feature: if these aren't set (or aren't
+// valid), the rest of the app runs fine, the upload endpoints just return
+// 503 — but we validate and LOG the reason at startup, rather than only
+// discovering a malformed value the first time someone tries to upload.
+function cleanEnvVar(raw) {
+  // .env values pasted from a dashboard commonly carry a trailing newline,
+  // wrapping quotes, or trailing slash — any of which breaks `new URL(...)`
+  // with a bare "Invalid URL" that's otherwise very hard to diagnose.
+  if (typeof raw !== 'string') return raw;
+  return raw.trim().replace(/^['"]|['"]$/g, '');
+}
 
-if (!R2_CONFIGURED) {
-  console.warn('WARNING: R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET not fully set — custom image upload is disabled, only Pexels/Pixabay search will work.');
+const R2_ENDPOINT_RAW = cleanEnvVar(process.env.R2_ENDPOINT);
+const R2_ENDPOINT = R2_ENDPOINT_RAW ? R2_ENDPOINT_RAW.replace(/\/+$/, '') : R2_ENDPOINT_RAW; // strip trailing slash(es)
+const R2_ACCESS_KEY_ID = cleanEnvVar(process.env.R2_ACCESS_KEY_ID);
+const R2_SECRET_ACCESS_KEY = cleanEnvVar(process.env.R2_SECRET_ACCESS_KEY);
+const R2_BUCKET = cleanEnvVar(process.env.R2_BUCKET);
+
+let R2_CONFIGURED = false;
+if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
+  const missing = [
+    !R2_ENDPOINT && 'R2_ENDPOINT',
+    !R2_ACCESS_KEY_ID && 'R2_ACCESS_KEY_ID',
+    !R2_SECRET_ACCESS_KEY && 'R2_SECRET_ACCESS_KEY',
+    !R2_BUCKET && 'R2_BUCKET'
+  ].filter(Boolean);
+  console.warn('WARNING: custom image upload disabled — missing env var(s): ' + missing.join(', '));
+} else {
+  try {
+    const parsed = new URL(R2_ENDPOINT);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('endpoint must start with http:// or https:// (got "' + parsed.protocol + '")');
+    }
+    if (parsed.pathname && parsed.pathname !== '/') {
+      // A path segment here almost always means someone pasted the
+      // per-bucket "S3 API" URL (which includes the bucket name) instead
+      // of the account-level endpoint — R2_BUCKET is a separate field.
+      console.warn('WARNING: R2_ENDPOINT has a path ("' + parsed.pathname + '") — did you paste the bucket-specific S3 API URL instead of the account endpoint? Expected form: https://<account_id>.r2.cloudflarestorage.com (no trailing path). Bucket name belongs in R2_BUCKET, not in the endpoint.');
+    }
+    R2_CONFIGURED = true;
+    console.log('R2/S3 storage configured — endpoint host: ' + parsed.host + ', bucket: ' + R2_BUCKET);
+  } catch (err) {
+    console.error('ERROR: R2_ENDPOINT is not a valid URL ("' + R2_ENDPOINT_RAW + '"): ' + err.message + '. Custom image upload is disabled until this is fixed.');
+    R2_CONFIGURED = false;
+  }
 }
 
 const s3Client = R2_CONFIGURED ? new S3Client({
@@ -1451,7 +1486,16 @@ app.post('/api/uploads/presign', authenticateToken, presignLimiter, async functi
     const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: UPLOAD_PRESIGN_TTL_SECONDS });
     res.json({ uploadUrl: uploadUrl, key: key, expiresIn: UPLOAD_PRESIGN_TTL_SECONDS, maxBytes: MAX_UPLOAD_BYTES, contentType: contentType });
   } catch (err) {
-    console.error('Presign error:', err.message);
+    // Log everything useful: which error type it was, the full message,
+    // and the (non-secret) config that produced it — "err.message" alone
+    // is often just "Invalid URL" with zero clue about which URL or why.
+    console.error(
+      'Presign error — name: ' + err.name +
+      ', message: ' + err.message +
+      ', R2_ENDPOINT: "' + R2_ENDPOINT + '"' +
+      ', R2_BUCKET: "' + R2_BUCKET + '"' +
+      (err.stack ? '\n' + err.stack : '')
+    );
     res.status(500).json({ error: 'Could not prepare upload.' });
   }
 });
