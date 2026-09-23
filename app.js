@@ -129,7 +129,7 @@ if (!R2_CONFIGURED) {
 }
 
 const s3Client = R2_CONFIGURED ? new S3Client({
-  region: 'us-east-005', // R2 ignores region; harmless for other S3-compatible providers too
+  region: 'auto', // R2 ignores region; harmless for other S3-compatible providers too
   endpoint: R2_ENDPOINT,
   credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
   forcePathStyle: true
