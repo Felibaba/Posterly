@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 // Marketing Poster Generator API — IMAGE ONLY (no embedded frontend)
 // Search query in -> Pexels stock photo -> branded JPEG
+// OR user-uploaded custom photo (direct-to-bucket via presigned URL) -> branded JPEG
 // Frontend is hosted in a separate repo; this process is API-only.
 //
 // Auth & billing:
@@ -9,9 +10,21 @@
 //   - Paystack subscription: free tier limited posters/day, paid unlimited
 //   - Admin panel at /admin-limits (password protected)
 //
+// Custom image uploads:
+//   - Browser PUTs the raw file straight to the bucket using a short-lived
+//     presigned URL — the bytes never pass through this server.
+//   - The bucket must be PRIVATE. At generate time, the server fetches the
+//     object back itself using its own credentials (never a client-given
+//     URL), so there's no SSRF surface and no public exposure of uploads.
+//   - Works with any S3-compatible provider (Cloudflare R2, Backblaze B2's
+//     S3-compatible API, MinIO, AWS S3 itself) — just point R2_ENDPOINT at
+//     the right host. For Cloudflare R2: https://<account_id>.r2.cloudflarestorage.com
+//     For Backblaze B2 (S3-compatible): https://s3.<region>.backblazeb2.com
+//
 // Setup:
 //   npm install express bcryptjs jsonwebtoken cors uuid express-rate-limit
 //               telegraf mongoose axios node-fetch@2 sharp dotenv
+//               @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
 //   .env:
 //     PORT=3000
 //     MONGODB_URI=mongodb://localhost:27017/postergen
@@ -23,6 +36,10 @@
 //     PAYSTACK_SECRET_KEY=...
 //     PEXELS_API_KEY=...
 //     PIXABAY_API_KEY=...          (fallback when Pexels is rate-limited / fails)
+//     R2_ENDPOINT=...              (e.g. https://<account_id>.r2.cloudflarestorage.com)
+//     R2_ACCESS_KEY_ID=...
+//     R2_SECRET_ACCESS_KEY=...
+//     R2_BUCKET=...                (private bucket — custom-image uploads only unlock when this is set)
 //   node app.js
 //   API root: GET http://localhost:3000/
 // ─────────────────────────────────────────────────────────────────────────
@@ -41,6 +58,8 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const sharp = require('sharp');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const BUILD_TAG = 'poster-app-image-only-2026-08-29-v1';
 
@@ -94,7 +113,41 @@ if (!PEXELS_API_KEY && !PIXABAY_API_KEY) {
   console.warn('WARNING: PIXABAY_API_KEY not set — no fallback if Pexels rate-limits.');
 }
 
-const MONTHLY_PRICE_KOBO = 200000; // NGN 2,000/mo for unlimited posters — adjust to taste
+// ==================== OBJECT STORAGE (custom image uploads) ====================
+// S3-compatible client — works with Cloudflare R2, Backblaze B2, MinIO, or
+// AWS S3 itself, just by pointing R2_ENDPOINT at the right host. Custom
+// image upload is an optional feature: if these aren't set, the rest of
+// the app runs fine, the upload endpoints just return 503.
+const R2_ENDPOINT = process.env.R2_ENDPOINT;
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+const R2_BUCKET = process.env.R2_BUCKET;
+const R2_CONFIGURED = !!(R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
+
+if (!R2_CONFIGURED) {
+  console.warn('WARNING: R2_ENDPOINT / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET not fully set — custom image upload is disabled, only Pexels/Pixabay search will work.');
+}
+
+const s3Client = R2_CONFIGURED ? new S3Client({
+  region: 'auto', // R2 ignores region; harmless for other S3-compatible providers too
+  endpoint: R2_ENDPOINT,
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+  forcePathStyle: true
+}) : null;
+
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8MB — generous for a phone photo, small enough to keep memory use sane
+const UPLOAD_PRESIGN_TTL_SECONDS = 300; // presigned PUT URL is only valid for 5 minutes
+const ALLOWED_UPLOAD_MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+
+// uploads/{userId}/{uuid}.{ext} — userId is itself a uuidv4 (see userSchema),
+// so this fully constrains the key shape and prevents path traversal or one
+// user referencing another user's upload.
+const UPLOAD_KEY_REGEX = /^uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(jpg|png|webp)$/;
+function isOwnUploadKey(key, userId) {
+  return typeof key === 'string' && UPLOAD_KEY_REGEX.test(key) && key.startsWith('uploads/' + userId + '/');
+}
+
+const MONTHLY_PRICE_KOBO = 500000; // NGN 5,000/mo for unlimited posters — adjust to taste
 
 // ==================== INPUT VALIDATION: LENGTH CAPS & CHARACTER RULES ====================
 const NAME_MAX_LENGTH = 80;
@@ -1306,12 +1359,17 @@ function buildOverlaySvg(opts) {
 }
 
 async function generatePosterImage(opts) {
-  const photoUrl = opts.photoUrl, hook = opts.hook, copy = opts.copy, cta = opts.cta;
+  const hook = opts.hook, copy = opts.copy, cta = opts.cta;
   const layout = opts.layout || LAYOUT_POST;
 
-  const photoRes = await fetch(photoUrl);
-  if (!photoRes.ok) throw new Error('Failed to download photo: ' + photoRes.status);
-  const photoBuffer = Buffer.from(await photoRes.arrayBuffer());
+  // Either a ready buffer (custom upload, already fetched from R2) or a URL
+  // to download (stock photo from Pexels/Pixabay) — exactly one is passed.
+  let photoBuffer = opts.photoBuffer;
+  if (!photoBuffer) {
+    const photoRes = await fetch(opts.photoUrl);
+    if (!photoRes.ok) throw new Error('Failed to download photo: ' + photoRes.status);
+    photoBuffer = Buffer.from(await photoRes.arrayBuffer());
+  }
 
   const photoResized = await sharp(photoBuffer)
     .resize(layout.width, layout.photoHeight, { fit: 'cover' })
@@ -1330,11 +1388,90 @@ async function generatePosterImage(opts) {
     .toBuffer();
 }
 
+// Fetches a previously-uploaded custom image back from R2/B2 using the
+// SERVER's own credentials — never a client-supplied URL, so there's no
+// SSRF surface here. HeadObject first, so an oversized object is rejected
+// without ever pulling its bytes into memory.
+async function fetchUploadedImageBuffer(key) {
+  const head = await s3Client.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  if (typeof head.ContentLength === 'number' && head.ContentLength > MAX_UPLOAD_BYTES) {
+    const err = new Error('Uploaded image is too large.');
+    err.status = 413;
+    throw err;
+  }
+
+  const obj = await s3Client.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  const chunks = [];
+  for await (const chunk of obj.Body) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+// Deletes an uploaded image from R2/B2 once it's been composited into a
+// poster — uploads are single-use, so nothing stays in the bucket longer
+// than it takes to generate the one poster it was uploaded for. Best-effort:
+// a delete failure here must never fail the actual /generate response, since
+// the poster was already successfully created — it just logs for cleanup.
+async function deleteUploadedImage(key) {
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  } catch (err) {
+    console.error('Failed to delete uploaded image ' + key + ' after use:', err.message);
+  }
+}
+
 // ==================== POSTER ROUTES (authenticated) ====================
+
+// Modest per-account limiter on presign requests — these are cheap to call
+// but each one reserves a slot for an upload, so unrestricted calls could
+// be used to fill the bucket with junk even if nothing ever gets generated.
+const presignLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many upload requests. Please try again later.' },
+  keyGenerator: function (req) { return req.user ? req.user.id : getClientIp(req); }
+});
+
+// Issues a short-lived presigned PUT URL so the browser can upload a custom
+// photo DIRECTLY to the bucket — the bytes never pass through this server.
+// The key is scoped under uploads/{userId}/ so ownership is enforced purely
+// by key shape (see isOwnUploadKey), with no separate ACL bookkeeping needed.
+app.post('/api/uploads/presign', authenticateToken, presignLimiter, async function (req, res) {
+  if (!R2_CONFIGURED) return res.status(503).json({ error: 'Custom image upload is not configured on this server.' });
+
+  const contentType = req.body.contentType;
+  const ext = ALLOWED_UPLOAD_MIME[contentType];
+  if (!ext) {
+    return res.status(400).json({ error: 'Unsupported image type. Use JPEG, PNG, or WebP.' });
+  }
+
+  const key = 'uploads/' + req.user.id + '/' + uuidv4() + '.' + ext;
+
+  try {
+    const command = new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, ContentType: contentType });
+    const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: UPLOAD_PRESIGN_TTL_SECONDS });
+    res.json({ uploadUrl: uploadUrl, key: key, expiresIn: UPLOAD_PRESIGN_TTL_SECONDS, maxBytes: MAX_UPLOAD_BYTES, contentType: contentType });
+  } catch (err) {
+    console.error('Presign error:', err.message);
+    res.status(500).json({ error: 'Could not prepare upload.' });
+  }
+});
+
 // Generates and returns the JPEG directly. Counts against the daily quota.
 app.get('/generate', authenticateToken, async function (req, res) {
   try {
-    const queryCheck = validateCapped(req.query.query, 'query', QUERY_MAX_LENGTH, true);
+    // Either a stock-photo search query, or a previously-uploaded custom
+    // image key — exactly one drives the poster's background photo.
+    const imageKey = typeof req.query.imageKey === 'string' ? req.query.imageKey.trim() : '';
+    const usingCustomImage = imageKey.length > 0;
+
+    if (usingCustomImage) {
+      if (!R2_CONFIGURED) return res.status(503).json({ error: 'Custom image upload is not configured on this server.' });
+      if (!isOwnUploadKey(imageKey, req.user.id)) {
+        return res.status(400).json({ error: 'Invalid or unrecognized image reference.' });
+      }
+    }
+
+    const queryCheck = validateCapped(req.query.query, 'query', QUERY_MAX_LENGTH, !usingCustomImage);
     if (!queryCheck.ok) return res.status(400).json({ error: queryCheck.error });
     const hookCheck = validateCapped(req.query.hook, 'hook', HOOK_MAX_LENGTH, true);
     if (!hookCheck.ok) return res.status(400).json({ error: hookCheck.error });
@@ -1379,10 +1516,33 @@ app.get('/generate', authenticateToken, async function (req, res) {
 
     const orientation = req.query.orientation === 'landscape' || req.query.orientation === 'square' ? req.query.orientation : 'portrait';
 
-    const photo = await searchStockPhoto(queryCheck.value, { orientation: orientation });
-    const imageBuffer = await generatePosterImage({
-      photoUrl: photo.photoUrl, hook: hookCheck.value, copy: copyCheck.value, cta: ctaCheck.value, layout: LAYOUT_POST
-    });
+    let imageBuffer;
+    if (usingCustomImage) {
+      let photoBuffer;
+      try {
+        photoBuffer = await fetchUploadedImageBuffer(imageKey);
+      } catch (err) {
+        if (err.name === 'NoSuchKey' || err.$metadata && err.$metadata.httpStatusCode === 404) {
+          return res.status(404).json({ error: 'Uploaded image not found or expired. Please upload it again.' });
+        }
+        if (err.status === 413) {
+          return res.status(413).json({ error: err.message });
+        }
+        throw err;
+      }
+      imageBuffer = await generatePosterImage({
+        photoBuffer: photoBuffer, hook: hookCheck.value, copy: copyCheck.value, cta: ctaCheck.value, layout: LAYOUT_POST
+      });
+      // The poster is composited and in memory now — the source upload has
+      // served its purpose and gets cleaned up immediately rather than
+      // waiting on a bucket lifecycle rule.
+      await deleteUploadedImage(imageKey);
+    } else {
+      const photo = await searchStockPhoto(queryCheck.value, { orientation: orientation });
+      imageBuffer = await generatePosterImage({
+        photoUrl: photo.photoUrl, hook: hookCheck.value, copy: copyCheck.value, cta: ctaCheck.value, layout: LAYOUT_POST
+      });
+    }
 
     await incrementPosterCount(req.user.id, 1);
     if (!subscribed && clientIp) {
@@ -1405,7 +1565,8 @@ app.get('/', function (req, res) {
     build: BUILD_TAG,
     docs: {
       auth: ['POST /api/auth/register', 'POST /api/auth/login', 'GET /api/auth/me'],
-      generate: 'GET /generate?query=&hook=&copy=&cta=&orientation=portrait',
+      generate: 'GET /generate?query=&hook=&copy=&cta=&orientation=portrait (or imageKey= instead of query, for a custom uploaded photo)',
+      uploads: 'POST /api/uploads/presign { contentType }',
       subscription: ['GET /api/subscription/status', 'POST /api/subscription/initiate'],
       admin: 'GET|POST /admin-limits',
       health: 'GET /ping'
