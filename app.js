@@ -1675,6 +1675,93 @@ async function loadAdminSettings() {
   }
 }
 
+// Dumps everything useful about an AWS SDK / S3-compatible error — name,
+// message, HTTP status, the provider's own error code, and the raw
+// response body if the SDK captured one. A bare err.message is often just
+// "UnknownError" or similar with zero diagnostic value on its own.
+function logS3Error(label, err) {
+  const status = err.$metadata && err.$metadata.httpStatusCode;
+  const requestId = err.$metadata && err.$metadata.requestId;
+  console.error(
+    '[storage self-test] ' + label + ' FAILED' +
+    ' — name: ' + err.name +
+    ', message: ' + err.message +
+    (status ? ', httpStatus: ' + status : '') +
+    (err.Code ? ', providerCode: ' + err.Code : '') +
+    (requestId ? ', requestId: ' + requestId : '') +
+    (err.stack ? '\n' + err.stack : '')
+  );
+}
+
+// Runs once at startup, entirely server-side — this deliberately skips the
+// browser and the presigned-URL flow, so it isolates whether a failure is
+// really credentials/region/bucket/permissions (this test will fail too)
+// versus a browser-only CORS block (this test will succeed even though
+// browser uploads still fail). Never blocks server startup and never
+// throws — worst case it just logs and moves on.
+async function runStorageSelfTest() {
+  if (!R2_CONFIGURED) {
+    console.log('[storage self-test] skipped — R2/B2 storage is not configured.');
+    return;
+  }
+
+  console.log('[storage self-test] starting — endpoint: ' + R2_ENDPOINT + ', region: ' + R2_REGION + ', bucket: ' + R2_BUCKET);
+
+  // Step 1: get a real image to test with. Prefer an actual Pexels photo
+  // (as asked); fall back to a tiny generated JPEG if Pexels isn't
+  // configured or fails, so a Pexels hiccup doesn't mask a storage result.
+  let imageBuffer;
+  try {
+    if (!PEXELS_API_KEY && !PIXABAY_API_KEY) throw new Error('no stock photo API key configured');
+    const photo = await searchStockPhoto('warehouse', { orientation: 'square' });
+    console.log('[storage self-test] Pexels/Pixabay search OK — provider: ' + photo.provider + ', photoUrl: ' + photo.photoUrl);
+    const photoRes = await fetch(photo.photoUrl);
+    if (!photoRes.ok) throw new Error('download responded ' + photoRes.status);
+    imageBuffer = Buffer.from(await photoRes.arrayBuffer());
+    console.log('[storage self-test] downloaded test image OK — ' + imageBuffer.length + ' bytes');
+  } catch (err) {
+    console.error('[storage self-test] could not fetch a Pexels/Pixabay image (' + err.message + ') — falling back to a generated test image so the storage test can still run.');
+    try {
+      imageBuffer = await sharp({ create: { width: 40, height: 40, channels: 3, background: '#1564C0' } }).jpeg().toBuffer();
+    } catch (genErr) {
+      console.error('[storage self-test] ABORTED — could not even generate a fallback test image: ' + genErr.message);
+      return;
+    }
+  }
+
+  const testKey = '_healthcheck/startup-test-' + Date.now() + '.jpg';
+
+  // Step 2: direct server-side upload — the real test. If this fails, the
+  // problem is credentials, region, bucket name, or bucket permissions,
+  // NOT CORS (CORS only affects browser requests, never this).
+  try {
+    const putResult = await s3Client.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: testKey, Body: imageBuffer, ContentType: 'image/jpeg' }));
+    console.log('[storage self-test] PutObject OK — key: ' + testKey + ', ETag: ' + putResult.ETag);
+  } catch (err) {
+    logS3Error('PutObject (server-side upload)', err);
+    console.error('[storage self-test] This is a REAL storage failure, not a browser/CORS issue — check R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_REGION, R2_BUCKET, and that this Application Key has write access to this bucket.');
+    return; // no point testing read-back/delete if the upload itself failed
+  }
+
+  // Step 3: read it back, to confirm the key we wrote is the key we can read.
+  try {
+    const head = await s3Client.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: testKey }));
+    console.log('[storage self-test] HeadObject OK — ContentLength: ' + head.ContentLength);
+  } catch (err) {
+    logS3Error('HeadObject (read-back)', err);
+  }
+
+  // Step 4: clean up the test object either way — best-effort.
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: testKey }));
+    console.log('[storage self-test] cleanup OK — test object deleted.');
+  } catch (err) {
+    logS3Error('DeleteObject (cleanup)', err);
+  }
+
+  console.log('[storage self-test] finished.');
+}
+
 mongoose.connection.once('open', async function () {
   try {
     await loadAdminSettings();
@@ -1690,6 +1777,12 @@ mongoose.connection.once('open', async function () {
 
     app.listen(PORT, function () {
       console.log('Marketing poster generator (image only) running on port ' + PORT + ' | Domain: https://' + DOMAIN);
+    });
+
+    // Fire-and-forget: never blocks the server from starting or accepting
+    // requests, purely diagnostic.
+    runStorageSelfTest().catch(function (err) {
+      console.error('[storage self-test] unexpected error running the test itself:', err);
     });
   } catch (err) {
     console.error('FATAL: startup sequence failed, exiting:', err.message);
