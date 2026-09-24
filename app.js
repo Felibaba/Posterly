@@ -10,16 +10,28 @@
 //   - Paystack subscription: free tier limited posters/day, paid unlimited
 //   - Admin panel at /admin-limits (password protected)
 //
-// Custom image uploads:
+// Custom image uploads (using Backblaze B2's S3-compatible API):
 //   - Browser PUTs the raw file straight to the bucket using a short-lived
 //     presigned URL — the bytes never pass through this server.
 //   - The bucket must be PRIVATE. At generate time, the server fetches the
 //     object back itself using its own credentials (never a client-given
 //     URL), so there's no SSRF surface and no public exposure of uploads.
-//   - Works with any S3-compatible provider (Cloudflare R2, Backblaze B2's
-//     S3-compatible API, MinIO, AWS S3 itself) — just point R2_ENDPOINT at
-//     the right host. For Cloudflare R2: https://<account_id>.r2.cloudflarestorage.com
-//     For Backblaze B2 (S3-compatible): https://s3.<region>.backblazeb2.com
+//   - Backblaze B2 setup:
+//     1. B2 Cloud Storage -> Buckets -> your bucket -> note the "Endpoint"
+//        shown there, e.g. s3.us-west-004.backblazeb2.com. R2_ENDPOINT is
+//        that value with https:// in front — nothing else in the path.
+//     2. Account -> Application Keys -> Add a New Application Key. The
+//        "keyID" it gives you is R2_ACCESS_KEY_ID; the "applicationKey" is
+//        R2_SECRET_ACCESS_KEY (shown once — copy it immediately).
+//     3. R2_REGION is normally auto-detected from the endpoint's own
+//        hostname (the "us-west-004" part) — only set it explicitly if
+//        you hit SignatureDoesNotMatch errors.
+//     4. CORS: your bucket -> Bucket Settings -> CORS Rules. Required for
+//        the browser's direct PUT to succeed at all — without it, uploads
+//        fail silently in the browser and your server logs show nothing,
+//        because the request never reaches this server.
+//   - Also works with Cloudflare R2, MinIO, or AWS S3 itself the same way,
+//     just with a different R2_ENDPOINT host.
 //
 // Setup:
 //   npm install express bcryptjs jsonwebtoken cors uuid express-rate-limit
@@ -36,10 +48,11 @@
 //     PAYSTACK_SECRET_KEY=...
 //     PEXELS_API_KEY=...
 //     PIXABAY_API_KEY=...          (fallback when Pexels is rate-limited / fails)
-//     R2_ENDPOINT=...              (e.g. https://<account_id>.r2.cloudflarestorage.com)
-//     R2_ACCESS_KEY_ID=...
-//     R2_SECRET_ACCESS_KEY=...
+//     R2_ENDPOINT=...              (Backblaze B2 example: https://s3.us-west-004.backblazeb2.com)
+//     R2_ACCESS_KEY_ID=...         (B2 Application Key's "keyID")
+//     R2_SECRET_ACCESS_KEY=...     (B2 Application Key's "applicationKey")
 //     R2_BUCKET=...                (private bucket — custom-image uploads only unlock when this is set)
+//     R2_REGION=...                (optional — only needed if auto-detection from R2_ENDPOINT gets it wrong)
 //   node app.js
 //   API root: GET http://localhost:3000/
 // ─────────────────────────────────────────────────────────────────────────
@@ -120,6 +133,16 @@ if (!PEXELS_API_KEY && !PIXABAY_API_KEY) {
 // valid), the rest of the app runs fine, the upload endpoints just return
 // 503 — but we validate and LOG the reason at startup, rather than only
 // discovering a malformed value the first time someone tries to upload.
+//
+// NOTE ON REGION: this matters more than it looks like it should. SigV4
+// (the signing scheme presigned URLs use) includes the region as part of
+// what gets signed. Cloudflare R2 special-cases the literal string "auto"
+// and ignores it. Backblaze B2's S3-compatible endpoint embeds a REAL
+// region in its hostname (e.g. s3.us-west-004.backblazeb2.com — the
+// "us-west-004" part) and requires that exact value; get it wrong and
+// every presigned URL fails with SignatureDoesNotMatch, which looks
+// exactly like a bad access key but isn't. We derive it automatically
+// below so this isn't something you have to get right by hand.
 function cleanEnvVar(raw) {
   // .env values pasted from a dashboard commonly carry a trailing newline,
   // wrapping quotes, or trailing slash — any of which breaks `new URL(...)`
@@ -128,13 +151,23 @@ function cleanEnvVar(raw) {
   return raw.trim().replace(/^['"]|['"]$/g, '');
 }
 
+function deriveS3Region(host, explicitRegion) {
+  if (explicitRegion) return explicitRegion; // R2_REGION always wins if set
+  const b2Match = host.match(/^s3\.([a-z0-9-]+)\.backblazeb2\.com$/i);
+  if (b2Match) return b2Match[1]; // e.g. "us-west-004"
+  if (/\.r2\.cloudflarestorage\.com$/i.test(host)) return 'auto';
+  return 'auto'; // best-effort default for other providers (e.g. MinIO) — override with R2_REGION if signing fails
+}
+
 const R2_ENDPOINT_RAW = cleanEnvVar(process.env.R2_ENDPOINT);
 const R2_ENDPOINT = R2_ENDPOINT_RAW ? R2_ENDPOINT_RAW.replace(/\/+$/, '') : R2_ENDPOINT_RAW; // strip trailing slash(es)
 const R2_ACCESS_KEY_ID = cleanEnvVar(process.env.R2_ACCESS_KEY_ID);
 const R2_SECRET_ACCESS_KEY = cleanEnvVar(process.env.R2_SECRET_ACCESS_KEY);
 const R2_BUCKET = cleanEnvVar(process.env.R2_BUCKET);
+const R2_REGION_OVERRIDE = cleanEnvVar(process.env.R2_REGION); // optional explicit override
 
 let R2_CONFIGURED = false;
+let R2_REGION = 'auto';
 if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
   const missing = [
     !R2_ENDPOINT && 'R2_ENDPOINT',
@@ -151,12 +184,13 @@ if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
     }
     if (parsed.pathname && parsed.pathname !== '/') {
       // A path segment here almost always means someone pasted the
-      // per-bucket "S3 API" URL (which includes the bucket name) instead
-      // of the account-level endpoint — R2_BUCKET is a separate field.
-      console.warn('WARNING: R2_ENDPOINT has a path ("' + parsed.pathname + '") — did you paste the bucket-specific S3 API URL instead of the account endpoint? Expected form: https://<account_id>.r2.cloudflarestorage.com (no trailing path). Bucket name belongs in R2_BUCKET, not in the endpoint.');
+      // per-bucket API URL (which includes the bucket name) instead of the
+      // account/region-level endpoint — R2_BUCKET is a separate field.
+      console.warn('WARNING: R2_ENDPOINT has a path ("' + parsed.pathname + '") — did you paste a bucket-specific URL instead of the account/region endpoint? For Cloudflare R2: https://<account_id>.r2.cloudflarestorage.com — for Backblaze B2: https://s3.<region>.backblazeb2.com — no trailing path either way. Bucket name belongs in R2_BUCKET.');
     }
+    R2_REGION = deriveS3Region(parsed.host, R2_REGION_OVERRIDE);
     R2_CONFIGURED = true;
-    console.log('R2/S3 storage configured — endpoint host: ' + parsed.host + ', bucket: ' + R2_BUCKET);
+    console.log('S3-compatible storage configured — endpoint host: ' + parsed.host + ', region: ' + R2_REGION + ', bucket: ' + R2_BUCKET);
   } catch (err) {
     console.error('ERROR: R2_ENDPOINT is not a valid URL ("' + R2_ENDPOINT_RAW + '"): ' + err.message + '. Custom image upload is disabled until this is fixed.');
     R2_CONFIGURED = false;
@@ -164,7 +198,7 @@ if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
 }
 
 const s3Client = R2_CONFIGURED ? new S3Client({
-  region: 'auto', // R2 ignores region; harmless for other S3-compatible providers too
+  region: R2_REGION,
   endpoint: R2_ENDPOINT,
   credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
   forcePathStyle: true
@@ -1493,6 +1527,7 @@ app.post('/api/uploads/presign', authenticateToken, presignLimiter, async functi
       'Presign error — name: ' + err.name +
       ', message: ' + err.message +
       ', R2_ENDPOINT: "' + R2_ENDPOINT + '"' +
+      ', R2_REGION: "' + R2_REGION + '"' +
       ', R2_BUCKET: "' + R2_BUCKET + '"' +
       (err.stack ? '\n' + err.stack : '')
     );
