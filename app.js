@@ -53,6 +53,7 @@
 //     R2_SECRET_ACCESS_KEY=...     (B2 Application Key's "applicationKey")
 //     R2_BUCKET=...                (private bucket — custom-image uploads only unlock when this is set)
 //     R2_REGION=...                (optional — only needed if auto-detection from R2_ENDPOINT gets it wrong)
+//     UPLOAD_ALLOWED_ORIGIN=...    (optional — your frontend's exact origin, e.g. https://yourapp.com. Defaults to "*" (every origin) if unset — the server applies this to the bucket's CORS rule automatically on startup, no manual dashboard step needed.)
 //   node app.js
 //   API root: GET http://localhost:3000/
 // ─────────────────────────────────────────────────────────────────────────
@@ -71,7 +72,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const sharp = require('sharp');
-const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand, PutBucketCorsCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const BUILD_TAG = 'poster-app-image-only-2026-08-29-v1';
@@ -1703,6 +1704,53 @@ function logS3Error(label, err) {
   );
 }
 
+// Applies a CORS rule to the bucket automatically on startup, via the
+// S3-compatible API's PutBucketCors call — no manual dashboard/CLI step
+// needed. Requires the B2 Application Key to have the "writeBuckets"
+// capability; without it this fails with AccessDenied (logged clearly
+// below), separate from any upload-credential issue.
+//
+// UPLOAD_ALLOWED_ORIGIN controls which origin is allowed: set it to your
+// real frontend origin (e.g. https://yourapp.com) once things are working.
+// Left unset, this defaults to "*" (every origin) as requested — fine for
+// getting unblocked right now, but it means ANY website could initiate an
+// upload using a presigned URL your server issues, not just yours. Worth
+// tightening once uploads are confirmed working.
+async function configureBucketCors() {
+  if (!R2_CONFIGURED) {
+    console.log('[cors setup] skipped — storage is not configured.');
+    return;
+  }
+
+  const allowedOrigin = cleanEnvVar(process.env.UPLOAD_ALLOWED_ORIGIN) || '*';
+  if (allowedOrigin === '*') {
+    console.warn('[cors setup] WARNING: applying wildcard ("*") CORS origin — every website can initiate uploads via presigned URLs from this server, not just yours. Set UPLOAD_ALLOWED_ORIGIN to your real frontend origin once uploads are confirmed working.');
+  }
+
+  try {
+    await s3Client.send(new PutBucketCorsCommand({
+      Bucket: R2_BUCKET,
+      CORSConfiguration: {
+        CORSRules: [
+          {
+            ID: 'postira-upload-cors',
+            AllowedOrigins: [allowedOrigin],
+            AllowedMethods: ['PUT'],
+            AllowedHeaders: ['*'],
+            MaxAgeSeconds: 3600
+          }
+        ]
+      }
+    }));
+    console.log('[cors setup] PutBucketCors OK — bucket: ' + R2_BUCKET + ', allowedOrigin: ' + allowedOrigin);
+  } catch (err) {
+    logS3Error('PutBucketCors (startup CORS setup)', err);
+    if (err.name === 'AccessDenied') {
+      console.error('[cors setup] This specific failure usually means the Application Key in use does NOT have the "writeBuckets" capability. Uploading files only needs writeFiles — setting CORS needs writeBuckets too. Create/edit the Application Key in the B2 console to include it, or set CORS manually via the B2 web console instead.');
+    }
+  }
+}
+
 // Runs once at startup, entirely server-side — this deliberately skips the
 // browser and the presigned-URL flow, so it isolates whether a failure is
 // really credentials/region/bucket/permissions (this test will fail too)
@@ -1792,10 +1840,18 @@ mongoose.connection.once('open', async function () {
     });
 
     // Fire-and-forget: never blocks the server from starting or accepting
-    // requests, purely diagnostic.
-    runStorageSelfTest().catch(function (err) {
-      console.error('[storage self-test] unexpected error running the test itself:', err);
-    });
+    // requests. CORS setup runs first so the self-test's timing (and any
+    // real browser upload attempts) happen after the rule is in place.
+    configureBucketCors()
+      .catch(function (err) {
+        console.error('[cors setup] unexpected error applying CORS:', err);
+      })
+      .then(function () {
+        return runStorageSelfTest();
+      })
+      .catch(function (err) {
+        console.error('[storage self-test] unexpected error running the test itself:', err);
+      });
   } catch (err) {
     console.error('FATAL: startup sequence failed, exiting:', err.message);
     process.exit(1);
